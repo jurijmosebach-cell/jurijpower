@@ -33,8 +33,5 @@ export default async function handler(req, res) {
     // 🔴 4. Fehlerbehandlung
     res.status(500).json({
       success: false,
-      message: "Fehler beim Laden der Spiele",
-      error: error.message
-    });
-  }
-}
+
+      
