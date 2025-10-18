@@ -1,199 +1,113 @@
-// JurijPower Pro - Live frontend
-// Fetches live fixtures from serverless proxy (/api/fixtures?live=all)
-// Shows all live matches, auto-refresh every 30s, computes simple pressure and triggers alarms.
-// Notes: Server must provide homePressure/awayPressure and xgHome/xgAway if available.
-(function(){
-  const POLL_MS = 30000; // 30s
-  const ALARM_PRESSURE = 75; // local alarm threshold
-  const PUSH_XG_THRESHOLD = 1.0; // xG threshold for push (stage 2)
-  const loginSection = document.getElementById('loginSection');
-  const appSection = document.getElementById('appSection');
-  const loginBtn = document.getElementById('loginBtn');
-  const pwInput = document.getElementById('pw');
-  const loginMsg = document.getElementById('loginMsg');
-  const logoutBtn = document.getElementById('logout');
-  const matchList = document.getElementById('matchList');
-  const status = document.getElementById('status');
-  const refreshBtn = document.getElementById('refreshBtn');
-  const leagueFilter = document.getElementById('leagueFilter');
+const API_KEY = "c6ad1210c71b17cca24284ab8a9873b4";
+const BASE_URL = "https://v3.football.api-sports.io";
 
-  // login persistence
-  function isLogged(){ return localStorage.getItem('jurij_logged')==='1'; }
-  function setLogged(v){ if(v)localStorage.setItem('jurij_logged','1'); else localStorage.removeItem('jurij_logged'); }
-  // audio context for beep
-  let audioCtx = null;
-  function playBeep(){
-    try{
-      if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = audioCtx.createOscillator();
-      const g = audioCtx.createGain();
-      o.type='sine'; o.frequency.value=880;
-      o.connect(g); g.connect(audioCtx.destination);
-      o.start();
-      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.35);
-      o.stop(audioCtx.currentTime + 0.4);
-    }catch(e){ console.warn('Beep failed', e); }
-  }
-
-  // notifications
-  function ensureNotificationPermission(){
-    if(!('Notification' in window)) return;
-    if(Notification.permission === 'default') Notification.requestPermission();
-  }
-  function sendPush(title, body){
-    try{
-      if(Notification.permission === 'granted') new Notification(title, { body });
-    }catch(e){ console.warn('Notification failed', e); }
-  }
-
-  // alarm tracking to avoid repeat spam for same match within short time
-  const lastAlarm = {}; // fixtureId -> timestamp
-
-  // login handlers
-  loginBtn.addEventListener('click', ()=>{
-    const PASSWORD = 'AjVqxu330Jm@12';
-    if(pwInput.value === PASSWORD){
-      setLogged(true); loginSection.classList.add('hidden'); appSection.classList.remove('hidden'); pwInput.value=''; loginMsg.textContent='';
-      startPolling();
-      ensureNotificationPermission();
-    } else {
-      loginMsg.textContent = '❌ Falsches Passwort';
-    }
+// Helper Funktion zum Fetchen
+async function fetchAPI(endpoint) {
+  const response = await fetch(`${BASE_URL}${endpoint}`, {
+    headers: { "x-apisports-key": API_KEY }
   });
-  logoutBtn.addEventListener('click', ()=>{
-    setLogged(false); appSection.classList.add('hidden'); loginSection.classList.remove('hidden'); stopPolling();
-  });
+  return response.json();
+}
 
-  // fetch fixtures via proxy
-  async function fetchFixtures(){
-    try{
-      const res = await fetch('/api/fixtures?live=all');
-      if(!res.ok) throw new Error('Fehler beim Abruf: ' + res.status);
-      const j = await res.json();
-      return j.response || [];
-    }catch(e){
-      status.textContent = 'Fehler: ' + (e.message || e);
-      return [];
-    }
+// Datum & Uhrzeit formatieren
+function formatDateTime(dateStr) {
+  const date = new Date(dateStr);
+  return date.toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" });
+}
+
+// Live Spiele laden
+async function loadLiveGames() {
+  const data = await fetchAPI("/fixtures?live=all");
+  const container = document.getElementById("liveGames");
+  container.innerHTML = "";
+
+  if (!data.response || data.response.length === 0) {
+    container.innerHTML = "<p>Keine Live Spiele 📭</p>";
+    return;
   }
 
-  // compute display pressure values (fallback if backend didn't provide)
-  function computePressures(m){
-    let hp = m.homePressure || 0;
-    let ap = m.awayPressure || 0;
-    if(!hp && !ap){
-      // fallback: use xg to estimate, else 50/50
-      const xgh = m.xgHome || 0; const xga = m.xgAway || 0;
-      const total = Math.max(0.001, xgh + xga);
-      if(total>0.001){
-        hp = Math.round((xgh/total)*100);
-        ap = Math.round((xga/total)*100);
-      } else { hp = 50; ap = 50; }
-    }
-    return { home: hp, away: ap };
-  }
-
-  function createMatchCard(m){
-    const div = document.createElement('div');
-    div.className = 'card';
-    const home = m.teams && m.teams.home ? m.teams.home.name : 'Heim';
-    const away = m.teams && m.teams.away ? m.teams.away.name : 'Auswärts';
-    const minute = m.minute || (m.raw && m.raw.fixture && m.raw.fixture.status && m.raw.fixture.status.elapsed) || 0;
-    const goals = m.goals ? ((m.goals.home||0) + ' : ' + (m.goals.away||0)) : '—';
-    const pressures = computePressures(m);
-    const maxPressure = Math.max(pressures.home, pressures.away);
-
-    // build inner HTML
-    div.innerHTML = `
-      <div style="flex:1">
-        <strong>${home}</strong> vs <strong>${away}</strong>
-        <div class="small">Minute: ${minute} • ${goals}</div>
-        <div class="bars">
-          <div>Heim: <span class="pHome">${pressures.home}%</span></div>
-          <div class="barWrap"><div class="bar home" style="width:${pressures.home}%"></div></div>
-          <div>Auswärts: <span class="pAway">${pressures.away}%</span></div>
-          <div class="barWrap"><div class="bar away" style="width:${pressures.away}%"></div></div>
-        </div>
-      </div>
-      <div style="width:140px;text-align:right">
-        <div id="signal${m.fixtureId}" class="signal ${pressures.home - pressures.away >= 10 ? 'good' : (pressures.away - pressures.home >= 10 ? 'bad' : 'neutral')}">
-          ${pressures.home - pressures.away >= 10 ? 'Heim dominiert' : (pressures.away - pressures.home >= 10 ? 'Auswärts dominiert' : 'Ausgeglichen')}
-        </div>
-        <div class="small">xG H:${(m.xgHome||0)} A:${(m.xgAway||0)}</div>
-        <div style="margin-top:8px"><button class="analyseBtn" data-id="${m.fixtureId}">Analyse</button></div>
-      </div>
+  data.response.forEach(game => {
+    const card = document.createElement("div");
+    card.className = "game-card";
+    card.innerHTML = `
+      <strong>${game.teams.home.name}</strong> vs <strong>${game.teams.away.name}</strong><br>
+      🕒 ${formatDateTime(game.fixture.date)}
     `;
+    container.appendChild(card);
+  });
+}
 
-    // add click handler for analyse
-    div.querySelector('.analyseBtn').addEventListener('click', ()=>{
-      alert(`${home} vs ${away}\nMinute: ${minute}\nHeimdruck: ${pressures.home}%\nAuswärtsdruck: ${pressures.away}%\nxG H:${m.xgHome||0} A:${m.xgAway||0}`);
-    });
+// Kommende Spiele (24h)
+async function loadUpcomingGames() {
+  const now = new Date();
+  const tomorrow = new Date(now.getTime() + 24*60*60*1000);
+  const from = now.toISOString().split("T")[0];
+  const to = tomorrow.toISOString().split("T")[0];
 
-    // return card and meta
-    return { el: div, pressures, maxPressure };
+  const data = await fetchAPI(`/fixtures?from=${from}&to=${to}`);
+  const container = document.getElementById("upcomingGames");
+  container.innerHTML = "";
+
+  if (!data.response || data.response.length === 0) {
+    container.innerHTML = "<p>Keine Spiele in den nächsten 24h 📭</p>";
+    return;
   }
 
-  // render matches sorted by pressure desc
-  async function render(){
-    status.textContent = 'Lade Spiele...';
-    const matches = await fetchFixtures();
-    // populate league filter
-    const leagues = {};
-    matches.forEach(m=>{ if(m.league && m.league.name) leagues[m.league.name]=1; });
-    leagueFilter.innerHTML = '<option value="all">Alle Ligen</option>';
-    Object.keys(leagues).forEach(l=>{
-      const opt = document.createElement('option'); opt.value=l; opt.textContent=l; leagueFilter.appendChild(opt);
-    });
+  data.response.forEach(game => {
+    const card = document.createElement("div");
+    card.className = "game-card";
+    card.innerHTML = `
+      <strong>${game.teams.home.name}</strong> vs <strong>${game.teams.away.name}</strong><br>
+      🕒 ${formatDateTime(game.fixture.date)}
+    `;
+    container.appendChild(card);
+  });
 
-    // sort by highest pressure
-    matches.sort((a,b)=>{
-      const pa = Math.max((a.homePressure||0),(a.awayPressure||0));
-      const pb = Math.max((b.homePressure||0),(b.awayPressure||0));
-      return pb - pa;
-    });
+  // Kombi generieren
+  generateBestCombo(data.response);
+}
 
-    matchList.innerHTML = '';
-    matches.forEach(m=>{
-      const { el, pressures, maxPressure } = createMatchCard(m);
-      matchList.appendChild(el);
+// Kombi mit höchstem Value generieren
+function generateBestCombo(games) {
+  // Einfacher Ansatz: Nimm 3 Spiele mit höchster Home-Quote (Value kann später verbessert werden)
+  const best = games
+    .filter(g => g.bookmakers && g.bookmakers.length > 0)
+    .map(g => {
+      const odds = g.bookmakers[0].bets[0].values;
+      const home = odds.find(o => o.value === "Home");
+      return {
+        match: `${g.teams.home.name} vs ${g.teams.away.name}`,
+        odd: home ? parseFloat(home.odd) : 1
+      };
+    })
+    .sort((a,b) => b.odd - a.odd)
+    .slice(0, 3);
 
-      // local alarm (tone+vibration) for pressure >= ALARM_PRESSURE
-      const now = Date.now();
-      const last = lastAlarm[m.fixtureId] || 0;
-      if(maxPressure >= ALARM_PRESSURE && now - last > 60*1000){ // at most once per minute per match
-        lastAlarm[m.fixtureId] = now;
-        // play beep + vibrate
-        playBeep();
-        if(navigator.vibrate) navigator.vibrate(500);
-      }
+  const totalOdds = best.reduce((acc, cur) => acc * cur.odd, 1).toFixed(2);
+  document.getElementById("totalOdds").innerText = `Gesamtquote: ${totalOdds}`;
+  document.getElementById("totalValue").innerText = `Kombi-Value: ${totalOdds}`;
 
-      // push condition: pressure>=ALARM_PRESSURE AND xG>=PUSH_XG_THRESHOLD
-      const xgMax = Math.max((m.xgHome||0),(m.xgAway||0));
-      if(maxPressure >= ALARM_PRESSURE && xgMax >= PUSH_XG_THRESHOLD && now - (lastAlarm[m.fixtureId+'_push']||0) > 60*1000){
-        lastAlarm[m.fixtureId+'_push'] = now;
-        const title = 'JurijPower – Torchance';
-        const body = `${m.teams.home.name} ${m.teams.away.name} • ${m.minute||0}’ • Druck ${maxPressure}% • xG ${xgMax}`;
-        sendPush(title, body);
-        // also play beep + vibrate for push
-        playBeep();
-        if(navigator.vibrate) navigator.vibrate([200,100,200]);
-        // bring this match to top by scrolling
-        el.scrollIntoView({ behavior:'smooth', block:'start' });
-      }
-    });
+  document.getElementById("copyCombo").onclick = () => {
+    const text = best.map(b => `${b.match} (Quote: ${b.odd})`).join("\n");
+    navigator.clipboard.writeText(text);
+    alert("Kombi kopiert ✅");
+  };
+}
 
-    status.textContent = 'Spiele geladen: ' + matches.length + ' • Letzte Aktualisierung: ' + new Date().toLocaleTimeString();
-  }
+// Update Zeit anzeigen
+function updateTime() {
+  document.getElementById("lastUpdate").innerText =
+    "Letztes Update: " + new Date().toLocaleString("de-DE");
+}
 
-  // refresh control
-  refreshBtn.addEventListener('click', render);
-  leagueFilter.addEventListener('change', render);
+// Event Listener
+document.getElementById("refreshBtn").addEventListener("click", () => {
+  loadLiveGames();
+  loadUpcomingGames();
+  updateTime();
+});
 
-  let pollId = null;
-  function startPolling(){ if(pollId) return; render(); pollId = setInterval(render, POLL_MS); }
-  function stopPolling(){ if(!pollId) return; clearInterval(pollId); pollId = null; }
-
-  // start if already logged
-  if(isLogged()){ loginSection.classList.add('hidden'); appSection.classList.remove('hidden'); startPolling(); ensureNotificationPermission(); }
-  // otherwise wait for login
-})();
+// Auto-Start beim Laden
+loadLiveGames();
+loadUpcomingGames();
+updateTime();
